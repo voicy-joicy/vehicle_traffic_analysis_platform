@@ -440,8 +440,8 @@ def main() -> None:
             st.session_state.last_uploaded_name = uploaded_file.name
             st.success(f"Selected file: {uploaded_file.name}")
             st.caption("The video is ready. Configure the options below, then click Start Analysis.")
-        elif current_stats is None:
-            st.info("Upload a traffic video and configure settings to begin analysis.")
+        #elif current_stats is None:
+         #   st.info("Upload a traffic video and configure settings to begin analysis.")
             
         st.markdown(
             "<div class='app-card'><div class='section-label'>Analysis Settings</div><h3>Dashboard</h3></div>",
