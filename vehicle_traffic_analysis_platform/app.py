@@ -1,7 +1,7 @@
 """
 Vehicle Traffic Analysis Platform
 ---------------------------------
-A Streamlit application for detecting vehicles in uploaded traffic videos using YOLOv8.
+A Streamlit application for detecting and tracking vehicles in uploaded traffic videos using YOLOv8 and ByteTrack.
 
 Run with:
     streamlit run app.py
@@ -30,6 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
 MODEL_DIR = BASE_DIR / "models"
+TRACKER_CONFIG = "bytetrack.yaml"
 
 
 @st.cache_resource(show_spinner=False)
@@ -373,7 +374,11 @@ def main() -> None:
         if uploaded_file is None and not current_stats:
             st.info("Upload a traffic video and configure settings to begin analysis.")
         if uploaded_file is not None:
+            st.session_state.last_uploaded_name = uploaded_file.name
             st.success(f"Selected file: {uploaded_file.name}")
+            st.caption("The video is ready. Configure the options below, then click Start Analysis.")
+        elif current_stats is None:
+            st.info("Upload a traffic video and configure settings to begin analysis.")
             
         st.markdown(
             "<div class='app-card'><div class='section-label'>Analysis Settings</div><h3>Dashboard</h3></div>",
@@ -391,6 +396,7 @@ def main() -> None:
             if uploaded_file is None:
                 st.warning("Please upload a video before starting analysis.")
             else:
+                processing_mode = "YOLOv8 + ByteTrack" if use_tracking else "YOLOv8 detection only"
                 with st.spinner("Processing uploaded video..."):
                     input_path = save_uploaded_video(uploaded_file)
                     output_path = get_output_path(input_path)
@@ -434,6 +440,11 @@ def main() -> None:
                     status_text.success("Analysis completed successfully.")
                     st.session_state.current_stats = stats
                     st.session_state.last_output_path = str(output_path)
+
+                     # Update local variables so results display immediately after processing.
+                    current_stats = stats
+                    output_path = output_path
+                    
                     st.session_state.analysis_history.insert(0, {
                         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "Video": uploaded_file.name,
@@ -492,6 +503,13 @@ def main() -> None:
             f"**Congestion level:** {current_stats['congestion_level']}  \n"
             f"**Avg vehicles/frame:** {current_stats['avg_vehicles_per_frame']:.2f}"
         )
+         if current_stats.get("class_counts"):
+            st.markdown("### Vehicle Type Summary")
+            class_df = pd.DataFrame(
+                list(current_stats["class_counts"].items()),
+                columns=["Vehicle Type", "Unique Count"],
+            )
+            st.dataframe(class_df, use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
     main()
