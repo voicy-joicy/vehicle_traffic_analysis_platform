@@ -6,483 +6,286 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, Set, Tuple, List, Optional
 
 import cv2
+import numpy as np
 
 
 # COCO class IDs used by pretrained YOLOv8 models.
 # 1 = bicycle, 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
-DEFAULT_VEHICLE_CLASS_IDS: Dict[int, str] = {
-    1: "bicycle",
-    2: "car",
-    3: "motorcycle",
-    5: "bus",
-    7: "truck",
+DEFAULT_VEHICLE_CLASS_IDS = [2, 3, 5, 7]
+
+VEHICLE_CLASS_NAMES = {
+    1: "Bicycle",
+    2: "Car",
+    3: "Motorcycle",
+    5: "Bus",
+    7: "Truck",
 }
 
 
-@dataclass
-class TrackState:
-    track_id: int
-    bbox: tuple[int, int, int, int]
-    class_id: int
-    class_name: str
-    score: float
-    last_seen: int
-    time_since_update: int = 0
-    history: list[tuple[int, int, int]] = field(default_factory=list)
-    line_crossed: bool = False
-    crossing_direction: Optional[str] = None
-
-
-class ByteTrack:
-    """Simplified ByteTrack-style tracker for vehicle tracking."""
-
-    def __init__(self, max_time_lost: int = 30, iou_threshold: float = 0.3) -> None:
-        self.max_time_lost = max_time_lost
-        self.iou_threshold = iou_threshold
-        self.next_id = 0
-        self.tracks: List[TrackState] = []
-
-    def update(self, detections: List[Dict[str, Any]], frame_idx: int) -> List[TrackState]:
-        """Update tracks using the latest detections and return active tracks."""
-        for track in self.tracks:
-            track.time_since_update += 1
-
-        candidate_tracks = [track for track in self.tracks if track.time_since_update <= self.max_time_lost]
-
-        for detection in sorted(detections, key=lambda item: item["score"], reverse=True):
-            best_track: Optional[TrackState] = None
-            best_iou = 0.0
-
-            for track in candidate_tracks:
-                if track.class_id != detection["class_id"]:
-                    continue
-                iou = _box_iou(track.bbox, detection["bbox"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_track = track
-
-            if best_track is not None and best_iou >= self.iou_threshold:
-                best_track.bbox = detection["bbox"]
-                best_track.score = detection["score"]
-                best_track.last_seen = frame_idx
-                best_track.time_since_update = 0
-                cx, cy = detection["center"]
-                best_track.history.append((frame_idx, cx, cy))
-                detection["track_id"] = best_track.track_id
-                candidate_tracks.remove(best_track)
-            else:
-                self.next_id += 1
-                cx, cy = detection["center"]
-                new_track = TrackState(
-                    track_id=self.next_id,
-                    bbox=detection["bbox"],
-                    class_id=detection["class_id"],
-                    class_name=detection["class_name"],
-                    score=detection["score"],
-                    last_seen=frame_idx,
-                )
-                new_track.history.append((frame_idx, cx, cy))
-                detection["track_id"] = new_track.track_id
-                self.tracks.append(new_track)
-
-        self.tracks = [track for track in self.tracks if track.time_since_update <= self.max_time_lost]
-        return self.tracks
+ProgressCallback = Optional[Callable[[float, str, Optional[np.ndarray]], None]]
 
 
 def ensure_project_folders(base_dir: Path) -> None:
     """Create required project folders if they do not already exist."""
-    for folder in ["uploads", "outputs", "models", "sample_videos", "utils"]:
-        (base_dir / folder).mkdir(parents=True, exist_ok=True)
+    folders = [
+        base_dir / "uploads",
+        base_dir / "outputs",
+        base_dir / "models",
+        base_dir / "utils",
+    ]
+
+    for folder in folders:
+        folder.mkdir(parents=True, exist_ok=True)
 
 
-def get_video_properties(cap: cv2.VideoCapture) -> Dict[str, int | float]:
-    """Read useful video properties from an OpenCV VideoCapture object."""
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # Fallback values for videos whose metadata cannot be read correctly.
-    if width <= 0:
-        width = 640
-    if height <= 0:
-        height = 480
-    if fps <= 0:
-        fps = 25.0
-    if total_frames < 0:
-        total_frames = 0
-
-    return {
-        "width": width,
-        "height": height,
-        "fps": fps,
-        "total_frames": total_frames,
-    }
-
-
-def _box_iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
-    """Compute IoU between two bounding boxes."""
-    x1 = max(box_a[0], box_b[0])
-    y1 = max(box_a[1], box_b[1])
-    x2 = min(box_a[2], box_b[2])
-    y2 = min(box_a[3], box_b[3])
-
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
-    if intersection == 0:
-        return 0.0
-
-    area_a = max(0, box_a[2] - box_a[0]) * max(0, box_a[3] - box_a[1])
-    area_b = max(0, box_b[2] - box_b[0]) * max(0, box_b[3] - box_b[1])
-    union = area_a + area_b - intersection
-    return intersection / union if union > 0 else 0.0
-
-
-def draw_detection(
-    frame,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    label: str,
-    confidence: float,
-    vehicle_id: Optional[int] = None,
-) -> None:
-    """Draw a bounding box and label on a video frame."""
-    colors = {
-        "car": (0, 255, 0),
-        "bus": (0, 0, 255),
-        "truck": (0, 165, 255),
-        "motorcycle": (191, 0, 255),
-    }
-    box_color = colors.get(label.lower(), (0, 255, 0))
-    text_color = (255, 255, 255)
-    label_bg_color = tuple(min(c + 30, 255) for c in box_color)
-
-    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-
-    label_text = label
-    if vehicle_id is not None:
-        label_text = f"{label}#{vehicle_id}"
-    text = f"{label_text} {confidence:.2f}"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.55
-    thickness = 2
-
-    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    y_text = max(y1 - 10, text_height + 10)
-
-    cv2.rectangle(
-        frame,
-        (x1, y_text - text_height - baseline),
-        (x1 + text_width + 6, y_text + baseline),
-        label_bg_color,
-        -1,
-    )
-    cv2.putText(frame, text, (x1 + 3, y_text), font, font_scale, text_color, thickness)
-
-
-def draw_summary_overlay(frame, frame_number: int, total_detections: int) -> None:
-    """Draw a small summary overlay on the frame."""
-    text = f"Frame: {frame_number} | Vehicle detections: {total_detections}"
-    cv2.rectangle(frame, (10, 10), (520, 48), (0, 0, 0), -1)
-    cv2.putText(
-        frame,
-        text,
-        (20, 38),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.75,
-        (255, 255, 255),
-        2,
-    )
-
-
-def process_video(
-    input_path: Path,
-    output_path: Path,
-    model,
-    vehicle_class_ids: Dict[int, str],
-    confidence_threshold: float = 0.35,
-    iou_threshold: float = 0.45,
-    frame_skip: int = 1,
-    use_tracker: bool = False,
-    tracking_line_position: float = 0.5,
-    progress_callback: Optional[Callable[[float, str, object], None]] = None,
-) -> Dict[str, object]:
-    """
-    Process a traffic video and save an annotated output video.
-
-    Parameters
-    ----------
-    input_path:
-        Path to the uploaded input video.
-    output_path:
-        Path where the processed video will be saved.
-    model:
-        Loaded Ultralytics YOLO model.
-    vehicle_class_ids:
-        Dictionary of YOLO class IDs to keep.
-    confidence_threshold:
-        Minimum confidence score for detections.
-    iou_threshold:
-        IoU threshold for non-maximum suppression.
-    frame_skip:
-        Process every Nth frame. Use 1 for best result.
-    use_tracker:
-        Whether to use ByteTrack-style tracking for stable IDs.
-    tracking_line_position:
-        Position of the crossing line as a fraction of frame height.
-    progress_callback:
-        Optional callback used by Streamlit to display progress.
-    """
-    if frame_skip < 1:
-        frame_skip = 1
-
+def _open_video(input_path: Path) -> cv2.VideoCapture:
+    """Open a video file and raise a clear error if it fails."""
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video file: {input_path}")
+        raise RuntimeError(f"Could not open video: {input_path}")
+    return cap
 
-    props = get_video_properties(cap)
-    width = int(props["width"])
-    height = int(props["height"])
-    fps = float(props["fps"])
-    total_frames = int(props["total_frames"])
 
+def _create_video_writer(output_path: Path, fps: float, width: int, height: int) -> cv2.VideoWriter:
+    """Create an MP4 video writer."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
     if not writer.isOpened():
-        cap.release()
         raise RuntimeError(f"Could not create output video: {output_path}")
 
-    tracker = ByteTrack(max_time_lost=max(30, frame_skip * 5), iou_threshold=0.3) if use_tracker else None
-    line_y = int(height * tracking_line_position)
+    return writer
 
-    frames_read = 0
+
+def _get_congestion_level(avg_vehicles_per_frame: float) -> str:
+    """Return a simple congestion level based on the average vehicles per frame."""
+    if avg_vehicles_per_frame < 3:
+        return "Low"
+    if avg_vehicles_per_frame < 8:
+        return "Moderate"
+    return "High"
+
+
+def _draw_text_box(frame: np.ndarray, text: str, x: int, y: int) -> None:
+    """Draw readable label text above a bounding box."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.55
+    thickness = 2
+    text_size, _ = cv2.getTextSize(text, font, scale, thickness)
+    text_w, text_h = text_size
+
+    y = max(y, text_h + 8)
+    cv2.rectangle(frame, (x, y - text_h - 8), (x + text_w + 8, y), (15, 23, 42), -1)
+    cv2.putText(frame, text, (x + 4, y - 5), font, scale, (255, 255, 255), thickness)
+
+
+def _draw_tracking_line(frame: np.ndarray, line_y: int) -> None:
+    """Draw the counting line used for up/down crossing estimation."""
+    height, width = frame.shape[:2]
+    cv2.line(frame, (0, line_y), (width, line_y), (255, 255, 0), 2)
+    cv2.putText(
+        frame,
+        "Counting Line",
+        (20, max(30, line_y - 12)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 0),
+        2,
+    )
+
+
+def _update_direction_counts(
+    track_id: int,
+    center_y: int,
+    line_y: int,
+    previous_centers: Dict[int, int],
+    counted_crossings: Set[Tuple[int, str]],
+    direction_counts: Dict[str, int],
+) -> None:
+    """Update up/down counts when a tracked vehicle crosses the middle line."""
+    previous_y = previous_centers.get(track_id)
+
+    if previous_y is not None:
+        if previous_y < line_y <= center_y and (track_id, "down") not in counted_crossings:
+            direction_counts["down"] += 1
+            counted_crossings.add((track_id, "down"))
+        elif previous_y > line_y >= center_y and (track_id, "up") not in counted_crossings:
+            direction_counts["up"] += 1
+            counted_crossings.add((track_id, "up"))
+
+    previous_centers[track_id] = center_y
+
+
+def process_video(
+    input_path: Path,
+    output_path: Path,
+    model: Any,
+    vehicle_class_ids: Iterable[int] = DEFAULT_VEHICLE_CLASS_IDS,
+    confidence_threshold: float = 0.35,
+    iou_threshold: float = 0.45,
+    frame_skip: int = 1,
+    use_tracker: bool = True,
+    tracker_config: str = "bytetrack.yaml",
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
+    """
+    Process a video using YOLOv8 detection and optional ByteTrack tracking.
+
+    When use_tracker=True, this function calls model.track(..., tracker="bytetrack.yaml")
+    and uses track IDs to count unique vehicles.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    vehicle_class_ids = list(vehicle_class_ids)
+    frame_skip = max(1, int(frame_skip))
+
+    cap = _open_video(input_path)
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+
+    if fps <= 0:
+        fps = 25.0
+
+    writer = _create_video_writer(output_path, fps, width, height)
+
+    line_y = height // 2
     frames_processed = 0
     total_vehicle_detections = 0
-    unique_vehicle_detections = 0
-    class_counts: Dict[str, int] = {}
-    active_tracks: List[Dict[str, object]] = []
-    vehicle_tracks: Dict[int, Dict[str, object]] = {}
-    cars_per_frame: List[int] = []
-    tracked_ids: set[int] = set()
-    direction_counts = {"up": 0, "down": 0}
-    line_crossing_counts = {"up": 0, "down": 0}
-    track_id_seq = 0
-    track_max_age = frame_skip + 5
-    start_time = time.time()
-    last_annotated_frame = None
+    tracked_vehicle_ids: Set[int] = set()
+    previous_centers: Dict[int, int] = {}
+    counted_crossings: Set[Tuple[int, str]] = set()
+    direction_counts = {"down": 0, "up": 0}
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    # Stores unique tracked IDs by class. If tracking is disabled, fallback IDs are generated per detection.
+    class_track_ids: Dict[str, Set[int]] = {
+        "Car": set(),
+        "Motorcycle": set(),
+        "Bus": set(),
+        "Truck": set(),
+    }
 
-        frames_read += 1
-        should_process = (frames_read - 1) % frame_skip == 0
+    fallback_detection_id = 0
 
-        if should_process:
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+
             frames_processed += 1
 
-            results = model.predict(
-                source=frame,
-                conf=confidence_threshold,
-                iou=iou_threshold,
-                verbose=False,
-            )
+            annotated_frame = frame.copy()
+            _draw_tracking_line(annotated_frame, line_y)
 
-            detections: List[Dict[str, Any]] = []
-            if results and results[0].boxes is not None:
-                boxes = results[0].boxes
-                for box in boxes:
-                    class_id = int(box.cls[0].item())
-                    if class_id not in vehicle_class_ids:
-                        continue
+            should_process = (frames_processed - 1) % frame_skip == 0
 
-                    confidence = float(box.conf[0].item())
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                    class_name = vehicle_class_ids[class_id]
-                    bbox = (x1, y1, x2, y2)
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
-                    detections.append(
-                        {
-                            "bbox": bbox,
-                            "score": confidence,
-                            "class_id": class_id,
-                            "class_name": class_name,
-                            "center": (cx, cy),
-                        }
+            if should_process:
+                if use_tracker:
+                    results = model.track(
+                        frame,
+                        persist=True,
+                        tracker=tracker_config,
+                        classes=vehicle_class_ids,
+                        conf=confidence_threshold,
+                        iou=iou_threshold,
+                        verbose=False,
+                    )
+                else:
+                    results = model.predict(
+                        frame,
+                        classes=vehicle_class_ids,
+                        conf=confidence_threshold,
+                        iou=iou_threshold,
+                        verbose=False,
                     )
 
-            total_vehicle_detections += len(detections)
-
-            if tracker is not None:
-                tracker.update(detections, frames_read)
-                current_tracks = [track for track in tracker.tracks if track.last_seen == frames_read]
-                frame_vehicle_count = len(current_tracks)
-
-                for track in current_tracks:
-                    x1, y1, x2, y2 = track.bbox
-                    draw_detection(frame, x1, y1, x2, y2, track.class_name, track.score, vehicle_id=track.track_id)
-
-                    if track.track_id not in tracked_ids:
-                        tracked_ids.add(track.track_id)
-                        unique_vehicle_detections += 1
-                        class_counts[track.class_name] = class_counts.get(track.class_name, 0) + 1
-
-                    if not track.line_crossed and len(track.history) >= 2:
-                        _, _, previous_y = track.history[-2]
-                        _, _, current_y = track.history[-1]
-                        if previous_y < line_y <= current_y:
-                            track.line_crossed = True
-                            track.crossing_direction = "down"
-                            direction_counts["down"] += 1
-                            line_crossing_counts["down"] += 1
-                        elif previous_y > line_y >= current_y:
-                            track.line_crossed = True
-                            track.crossing_direction = "up"
-                            direction_counts["up"] += 1
-                            line_crossing_counts["up"] += 1
-            else:
                 if results and results[0].boxes is not None:
                     boxes = results[0].boxes
 
-                    frame_vehicle_count = 0
-                    for box in boxes:
-                        class_id = int(box.cls[0].item())
-                        if class_id not in vehicle_class_ids:
-                            continue
+                    xyxy = boxes.xyxy.cpu().numpy().astype(int) if boxes.xyxy is not None else []
+                    class_ids = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else []
+                    confidences = boxes.conf.cpu().numpy() if boxes.conf is not None else []
 
-                        confidence = float(box.conf[0].item())
-                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                        class_name = vehicle_class_ids[class_id]
-                        bbox = (x1, y1, x2, y2)
-                        cx = int((x1 + x2) / 2)
-                        cy = int((y1 + y2) / 2)
+                    if use_tracker and boxes.id is not None:
+                        track_ids = boxes.id.cpu().numpy().astype(int)
+                    else:
+                        # Detection-only fallback: each detection receives a temporary ID.
+                        track_ids = []
+                        for _ in range(len(xyxy)):
+                            fallback_detection_id += 1
+                            track_ids.append(fallback_detection_id)
 
-                        best_track = None
-                        best_iou = 0.0
-                        for track in active_tracks:
-                            if track["class_name"] != class_name:
-                                continue
-                            if frames_read - track["last_seen"] > track_max_age:
-                                continue
+                    total_vehicle_detections += len(xyxy)
 
-                            current_iou = _box_iou(track["bbox"], bbox)
-                            if current_iou > best_iou:
-                                best_iou = current_iou
-                                best_track = track
+                    for box, class_id, confidence, track_id in zip(xyxy, class_ids, confidences, track_ids):
+                        x1, y1, x2, y2 = box
+                        center_x = int((x1 + x2) / 2)
+                        center_y = int((y1 + y2) / 2)
+                        class_name = VEHICLE_CLASS_NAMES.get(int(class_id), "Vehicle")
 
-                        if best_track is not None and best_iou >= 0.30:
-                            matched_id = best_track["id"]
-                            best_track["bbox"] = bbox
-                            best_track["last_seen"] = frames_read
-                            best_track["history"].append((frames_read, cx, cy))
+                        tracked_vehicle_ids.add(int(track_id))
+                        if class_name in class_track_ids:
+                            class_track_ids[class_name].add(int(track_id))
+
+                        if use_tracker:
+                            _update_direction_counts(
+                                int(track_id),
+                                center_y,
+                                line_y,
+                                previous_centers,
+                                counted_crossings,
+                                direction_counts,
+                            )
+
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (34, 211, 238), 2)
+                        cv2.circle(annotated_frame, (center_x, center_y), 4, (251, 146, 60), -1)
+
+                        if use_tracker:
+                            label = f"{class_name} ID:{int(track_id)} {float(confidence):.2f}"
                         else:
-                            track_id_seq += 1
-                            matched_id = track_id_seq
-                            new_track = {
-                                "id": matched_id,
-                                "bbox": bbox,
-                                "class_name": class_name,
-                                "last_seen": frames_read,
-                                "history": [(frames_read, cx, cy)],
-                            }
-                            active_tracks.append(new_track)
-                            vehicle_tracks[matched_id] = new_track
-                            unique_vehicle_detections += 1
-                            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+                            label = f"{class_name} {float(confidence):.2f}"
 
-                        draw_detection(frame, x1, y1, x2, y2, class_name, confidence, vehicle_id=matched_id)
-                        frame_vehicle_count += 1
+                        _draw_text_box(annotated_frame, label, x1, y1 - 8)
 
-                    active_tracks = [
-                        track
-                        for track in active_tracks
-                        if frames_read - track["last_seen"] <= track_max_age
-                    ]
-                else:
-                    frame_vehicle_count = 0
+            writer.write(annotated_frame)
 
-            cars_per_frame.append(frame_vehicle_count)
-            draw_summary_overlay(frame, frames_read, total_vehicle_detections)
-            last_annotated_frame = frame.copy()
-        else:
-            draw_summary_overlay(frame, frames_read, total_vehicle_detections)
+            if progress_callback is not None:
+                progress = frames_processed / total_frames if total_frames > 0 else 0.0
+                mode = "tracking" if use_tracker else "detection"
+                message = f"Processing frame {frames_processed} of {total_frames} using {mode}..."
 
-        writer.write(frame)
+                # Send preview occasionally to keep Streamlit responsive.
+                preview_frame = annotated_frame if frames_processed % max(1, frame_skip) == 0 else None
+                progress_callback(progress, message, preview_frame)
 
-        if progress_callback and (frames_read % 10 == 0 or frames_read == 1):
-            progress = frames_read / total_frames if total_frames > 0 else 0.0
-            progress_callback(
-                progress,
-                f"Processed {frames_read} of {total_frames if total_frames else 'unknown'} frames...",
-                last_annotated_frame if last_annotated_frame is not None else frame,
-            )
+    finally:
+        cap.release()
+        writer.release()
 
-    cap.release()
-    writer.release()
+    unique_vehicle_detections = len(tracked_vehicle_ids)
+    avg_vehicles_per_frame = total_vehicle_detections / frames_processed if frames_processed else 0.0
 
-    elapsed = max(time.time() - start_time, 0.001)
-    processing_fps = frames_read / elapsed
-
-    avg_car_speed = 0.0
-    if use_tracker:
-        car_tracks = [
-            track for track in tracker.tracks if track.class_name == "car" and len(track.history) > 1
-        ]
-    else:
-        car_tracks = [
-            track for track in vehicle_tracks.values() if track["class_name"] == "car" and len(track["history"]) > 1
-        ]
-
-    if car_tracks:
-        speed_values = []
-        for track in car_tracks:
-            total_dist = 0.0
-            total_time = 0.0
-            history = track.history if use_tracker else track["history"]
-            for (frame_idx, x, y), (next_frame, nx, ny) in zip(history, history[1:]):
-                dist = math.hypot(nx - x, ny - y)
-                time_delta = (next_frame - frame_idx) / fps
-                if time_delta > 0:
-                    total_dist += dist
-                    total_time += time_delta
-            if total_time > 0:
-                speed_values.append(total_dist / total_time)
-        if speed_values:
-            avg_car_speed = sum(speed_values) / len(speed_values)
-
-    avg_vehicles_per_frame = sum(cars_per_frame) / len(cars_per_frame) if cars_per_frame else 0.0
-    if avg_vehicles_per_frame > 8:
-        congestion_level = "High"
-    elif avg_vehicles_per_frame > 4:
-        congestion_level = "Medium"
-    else:
-        congestion_level = "Low"
-
-    if progress_callback:
-        progress_callback(1.0, "Video processing completed.", last_annotated_frame)
+    class_counts = {
+        class_name: len(ids)
+        for class_name, ids in class_track_ids.items()
+        if len(ids) > 0
+    }
 
     return {
-        "frames_read": frames_read,
         "frames_processed": frames_processed,
         "total_vehicle_detections": total_vehicle_detections,
         "unique_vehicle_detections": unique_vehicle_detections,
-        "tracked_vehicles": len(tracked_ids) if use_tracker else unique_vehicle_detections,
-        "avg_car_speed": avg_car_speed,
-        "congestion_level": congestion_level,
-        "avg_vehicles_per_frame": avg_vehicles_per_frame,
-        "class_counts": class_counts,
+        "tracked_vehicles": unique_vehicle_detections if use_tracker else 0,
         "direction_counts": direction_counts,
-        "line_crossing_counts": line_crossing_counts,
-        "processing_fps": processing_fps,
-        "output_video": str(output_path),
-        "input_video": str(input_path),
-        "frame_skip": frame_skip,
+        "avg_vehicles_per_frame": avg_vehicles_per_frame,
+        "congestion_level": _get_congestion_level(avg_vehicles_per_frame),
+        "class_counts": class_counts,
+        "tracker_used": tracker_config if use_tracker else "None",
     }
