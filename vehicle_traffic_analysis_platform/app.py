@@ -16,6 +16,7 @@ from typing import Dict, Tuple
 
 import cv2
 import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 from ultralytics import YOLO
 
@@ -274,6 +275,38 @@ def render_settings() -> Tuple[str, float, float, int, bool, bool]:
    # )
 
     return model_choice, confidence, iou, frame_skip, show_preview, use_tracking
+def render_vehicle_type_pie_chart(class_counts: dict) -> None:
+    """Display vehicle type summary as a simple pie chart."""
+    chart_data = {
+        vehicle_type: count
+        for vehicle_type, count in class_counts.items()
+        if count > 0
+    }
+
+    if not chart_data:
+        st.info("No vehicle type data is available for this analysis.")
+        return
+
+    labels = list(chart_data.keys())
+    values = list(chart_data.values())
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.pie(
+        values,
+        labels=labels,
+        autopct="%1.1f%%",
+        startangle=90,
+        textprops={"fontsize": 10},
+    )
+    ax.axis("equal")
+    ax.set_title("Vehicle Type Distribution")
+
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    st.caption(
+        "This pie chart shows the proportion of detected vehicle types based on the unique tracked vehicle counts."
+    )
 
 
 def main() -> None:
@@ -505,11 +538,7 @@ def main() -> None:
         )
         if current_stats.get("class_counts"):
             st.markdown("### Vehicle Type Summary")
-            class_df = pd.DataFrame(
-                list(current_stats["class_counts"].items()),
-                columns=["Vehicle Type", "Unique Count"],
-            )
-            st.dataframe(class_df, use_container_width=True, hide_index=True)
+            render_vehicle_type_pie_chart(current_stats["class_counts"])
 
 if __name__ == "__main__":
     main()
