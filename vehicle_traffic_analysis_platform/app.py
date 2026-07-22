@@ -289,25 +289,55 @@ def render_vehicle_type_pie_chart(class_counts: dict) -> None:
 
     labels = list(chart_data.keys())
     values = list(chart_data.values())
+    total = sum(values)
+    
+    def show_percentage(percent: float) -> str:
+        """Hide very small percentage labels to prevent overlap."""
+        return f"{percent:.1f}%" if percent >= 5 else ""
 
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.pie(
+    fig, ax = plt.subplots(figsize=(3, 3))
+    wedges, _, autotexts = ax.pie(
         values,
-        labels=labels,
-        autopct="%1.1f%%",
+        labels=None,
+        autopct=show_percentage,
         startangle=90,
-        textprops={"fontsize": 10},
+        pctdistance=0.72,
+        textprops={"fontsize": 8},
     )
-    ax.axis("equal")
-    ax.set_title("Vehicle Type Distribution")
 
-    st.pyplot(fig, use_container_width=True)
+    for autotext in autotexts:
+        autotext.set_fontsize(8)
+        autotext.set_weight("bold")
+
+    legend_labels = [
+        f"{label}: {value} ({(value / total) * 100:.1f}%)"
+        for label, value in zip(labels, values)
+    ]
+
+     ax.legend(
+        wedges,
+        legend_labels,
+        title="Vehicle types",
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize=8,
+        title_fontsize=9,
+        frameon=False,
+    )
+
+     ax.axis("equal")
+    ax.set_title("Vehicle Type Distribution", fontsize=11)
+    fig.tight_layout()
+
+    chart_col, _ = st.columns([1.2, 1])
+    with chart_col:
+        st.pyplot(fig, use_container_width=False)
+
     plt.close(fig)
 
     st.caption(
-        "This pie chart shows the proportion of detected vehicle types based on the unique tracked vehicle counts."
+        "The pie chart shows the proportion of unique tracked vehicles by type."
     )
-
 
 def main() -> None:
     ensure_project_folders(BASE_DIR)
