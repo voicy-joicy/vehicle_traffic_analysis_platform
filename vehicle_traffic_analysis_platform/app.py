@@ -31,8 +31,11 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs"
 MODEL_DIR = BASE_DIR / "models"
-TRACKER_CONFIG = "bytetrack.yaml"
+CUSTOM_TRACKER_PATH = BASE_DIR / "custom_bytetrack.yaml"
 
+def get_tracker_config() -> str:
+    """Use custom ByteTrack settings if available, otherwise use Ultralytics default."""
+    return str(CUSTOM_TRACKER_PATH) if CUSTOM_TRACKER_PATH.exists() else "bytetrack.yaml"
 
 @st.cache_resource(show_spinner=False)
 def load_yolo_model(model_choice: str) -> YOLO:
@@ -275,6 +278,7 @@ def render_settings() -> Tuple[str, float, float, int, bool, bool]:
    # )
 
     return model_choice, confidence, iou, frame_skip, show_preview, use_tracking
+
 def render_vehicle_type_pie_chart(class_counts: dict) -> None:
     """Display vehicle type summary as a simple pie chart."""
     chart_data = {
