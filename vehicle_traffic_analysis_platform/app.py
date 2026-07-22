@@ -314,7 +314,7 @@ def render_vehicle_type_pie_chart(class_counts: dict) -> None:
         for label, value in zip(labels, values)
     ]
 
-     ax.legend(
+    ax.legend(
         wedges,
         legend_labels,
         title="Vehicle types",
