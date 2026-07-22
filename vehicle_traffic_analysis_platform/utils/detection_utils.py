@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import math
-import time
-from dataclasses import dataclass, field
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Set, Tuple, List, Optional
 
@@ -17,13 +15,15 @@ import numpy as np
 DEFAULT_VEHICLE_CLASS_IDS = [2, 3, 5, 7]
 
 VEHICLE_CLASS_NAMES = {
-    1: "Bicycle",
     2: "Car",
     3: "Motorcycle",
     5: "Bus",
     7: "Truck",
 }
 
+# A track must appear in at least this number of processed frames before it is counted.
+# This reduces false IDs from one-frame mistakes.
+MIN_TRACK_FRAMES_FOR_COUNT = 3
 
 ProgressCallback = Optional[Callable[[float, str, Optional[np.ndarray]], None]]
 
@@ -119,6 +119,11 @@ def _update_direction_counts(
 
     previous_centers[track_id] = center_y
 
+def _majority_class(class_votes: Dict[str, int], default_class: str = "Vehicle") -> str:
+    """Return the most frequent class name for a tracked object."""
+    if not class_votes:
+        return default_class
+    return max(class_votes.items(), key=lambda item: item[1])[0]
 
 def process_video(
     input_path: Path,
@@ -133,16 +138,21 @@ def process_video(
     progress_callback: ProgressCallback = None,
 ) -> Dict[str, Any]:
     """
-    Process a video using YOLOv8 detection and optional ByteTrack tracking.
+     Process a video using YOLOv8 detection and optional ByteTrack tracking.
 
-    When use_tracker=True, this function calls model.track(..., tracker="bytetrack.yaml")
-    and uses track IDs to count unique vehicles.
+    Important tracking improvements:
+    - Tracking automatically uses every frame, because skipping frames makes ID switching worse.
+    - A vehicle is counted only after it appears in several frames.
+    - Vehicle type is decided using majority voting per track ID, so one mistaken frame
+      does not count a car as a motorcycle or truck.
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
-    vehicle_class_ids = list(vehicle_class_ids)
-    frame_skip = max(1, int(frame_skip))
+    vehicle_class_ids = [int(class_id) for class_id in vehicle_class_ids]
 
+    # ByteTrack should receive consecutive frames. If frames are skipped, the tracker may lose vehicles.
+    frame_skip = 1 if use_tracker else max(1, int(frame_skip))
+    
     cap = _open_video(input_path)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -163,14 +173,12 @@ def process_video(
     counted_crossings: Set[Tuple[int, str]] = set()
     direction_counts = {"down": 0, "up": 0}
 
-    # Stores unique tracked IDs by class. If tracking is disabled, fallback IDs are generated per detection.
-    class_track_ids: Dict[str, Set[int]] = {
-        "Car": set(),
-        "Motorcycle": set(),
-        "Bus": set(),
-        "Truck": set(),
-    }
+    # Tracking memory
+    tracked_vehicle_ids: Set[int] = set()
+    track_frame_counts: Dict[int, int] = defaultdict(int)
+    track_class_votes: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
+    # Used only when tracking is disabled.
     fallback_detection_id = 0
 
     try:
@@ -216,27 +224,37 @@ def process_video(
                     if use_tracker and boxes.id is not None:
                         track_ids = boxes.id.cpu().numpy().astype(int)
                     else:
-                        # Detection-only fallback: each detection receives a temporary ID.
                         track_ids = []
                         for _ in range(len(xyxy)):
                             fallback_detection_id += 1
                             track_ids.append(fallback_detection_id)
 
-                    total_vehicle_detections += len(xyxy)
-
                     for box, class_id, confidence, track_id in zip(xyxy, class_ids, confidences, track_ids):
+                        class_id = int(class_id)
+
+                        # Extra safety: ignore anything outside the selected vehicle classes.
+                        if class_id not in vehicle_class_ids:
+                            continue
+
+                        class_name = VEHICLE_CLASS_NAMES.get(class_id)
+                        if class_name is None:
+                            continue
+
                         x1, y1, x2, y2 = box
                         center_x = int((x1 + x2) / 2)
                         center_y = int((y1 + y2) / 2)
-                        class_name = VEHICLE_CLASS_NAMES.get(int(class_id), "Vehicle")
+                        track_id = int(track_id)
 
-                        tracked_vehicle_ids.add(int(track_id))
-                        if class_name in class_track_ids:
-                            class_track_ids[class_name].add(int(track_id))
+                        total_vehicle_detections += 1
+                        tracked_vehicle_ids.add(track_id)
+                        track_frame_counts[track_id] += 1
+                        track_class_votes[track_id][class_name] += 1
+
+                        stable_class_name = _majority_class(track_class_votes[track_id], class_name)
 
                         if use_tracker:
                             _update_direction_counts(
-                                int(track_id),
+                                track_id,
                                 center_y,
                                 line_y,
                                 previous_centers,
@@ -248,9 +266,9 @@ def process_video(
                         cv2.circle(annotated_frame, (center_x, center_y), 4, (251, 146, 60), -1)
 
                         if use_tracker:
-                            label = f"{class_name} ID:{int(track_id)} {float(confidence):.2f}"
+                            label = f"{stable_class_name} ID:{track_id} {float(confidence):.2f}"
                         else:
-                            label = f"{class_name} {float(confidence):.2f}"
+                            label = f"{stable_class_name} {float(confidence):.2f}"
 
                         _draw_text_box(annotated_frame, label, x1, y1 - 8)
 
@@ -261,7 +279,6 @@ def process_video(
                 mode = "tracking" if use_tracker else "detection"
                 message = f"Processing frame {frames_processed} of {total_frames} using {mode}..."
 
-                # Send preview occasionally to keep Streamlit responsive.
                 preview_frame = annotated_frame if frames_processed % max(1, frame_skip) == 0 else None
                 progress_callback(progress, message, preview_frame)
 
@@ -269,14 +286,24 @@ def process_video(
         cap.release()
         writer.release()
 
-    unique_vehicle_detections = len(tracked_vehicle_ids)
-    avg_vehicles_per_frame = total_vehicle_detections / frames_processed if frames_processed else 0.0
+    # Count only stable tracks that appeared in enough frames.
+    if use_tracker:
+        stable_track_ids = {
+            track_id
+            for track_id, count in track_frame_counts.items()
+            if count >= MIN_TRACK_FRAMES_FOR_COUNT
+        }
+    else:
+        stable_track_ids = tracked_vehicle_ids
 
-    class_counts = {
-        class_name: len(ids)
-        for class_name, ids in class_track_ids.items()
-        if len(ids) > 0
-    }
+    class_counts: Dict[str, int] = {}
+    for track_id in stable_track_ids:
+        class_name = _majority_class(track_class_votes.get(track_id, {}), "Vehicle")
+        if class_name != "Vehicle":
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+
+    unique_vehicle_detections = len(stable_track_ids)
+    avg_vehicles_per_frame = total_vehicle_detections / frames_processed if frames_processed else 0.0
 
     return {
         "frames_processed": frames_processed,
