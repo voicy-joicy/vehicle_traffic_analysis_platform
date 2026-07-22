@@ -325,7 +325,7 @@ def render_vehicle_type_pie_chart(class_counts: dict) -> None:
         frameon=False,
     )
 
-     ax.axis("equal")
+    ax.axis("equal")
     ax.set_title("Vehicle Type Distribution", fontsize=11)
     fig.tight_layout()
 
