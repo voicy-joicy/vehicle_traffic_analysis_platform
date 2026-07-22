@@ -503,7 +503,7 @@ def main() -> None:
             f"**Congestion level:** {current_stats['congestion_level']}  \n"
             f"**Avg vehicles/frame:** {current_stats['avg_vehicles_per_frame']:.2f}"
         )
-         if current_stats.get("class_counts"):
+        if current_stats.get("class_counts"):
             st.markdown("### Vehicle Type Summary")
             class_df = pd.DataFrame(
                 list(current_stats["class_counts"].items()),
